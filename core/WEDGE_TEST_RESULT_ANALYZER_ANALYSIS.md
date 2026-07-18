@@ -1,298 +1,407 @@
-# WedgeTestResult Analyzer 功能与实现原理
+# ConvolutionEngine 功能与方法说明
 
 ## 1. 模块定位
 
-`wedgeTestResult_analyzer.py` 是 WedgeMaster 的核心标定模块。它把三类数据关联起来：
+`core/convolution_engine.py` 是 WTV 中的二维卷积计算与结果输出模块。它接收：
 
-1. WedgeTest Recipe 中每个扫描点的位置与 `vy` 参数；
-2. 刻蚀前、刻蚀后的膜厚测量结果；
-3. 可选的二维 Beam Profile。
+1. 一张带 x、y 坐标的 dwell-time（停留时间）二维网格；
+2. 一张二维离子束强度或刻蚀能力 Profile；
 
-模块首先根据膜厚差计算每个测量点的实际去除量，然后将去除量配准到 Recipe 的扫描点，建立“`1 / vy` 与实际去除量”的过原点线性关系。回归斜率用于计算 Beam Peak，并可进一步归一化二维 Beam Profile、计算其沿 y 方向的离散积分。
+然后通过离散二维卷积计算预测刻蚀深度分布，并输出坐标化 CSV 和热力图 PNG。
 
-从业务角度看，这个模块完成的是：**利用一次 Wedge Test 的实测去除结果，反推出扫描参数与束流去除能力之间的标定系数。**
+这个模块还负责以下辅助功能：
 
-## 2. 对象状态与数据模型
+- dwell-time 的上下镜像以及镜像后坐标转换；
+- 圆形晶圆区域的可视化遮罩；
+- 线性或对数色标选择；
+- 镜像 dwell-time 中间文件保存；
+- 输入或计算失败时生成错误占位文件。
 
-`WedgeTestAnalyzer` 是有状态对象，主要保存以下数据：
+在当前业务链路中，它既服务于独立的“卷积积分”界面，也被 `IonBeamProcessor` 用作模拟刻蚀结果的卷积验算器。
 
-| 属性 | 内容 |
-| --- | --- |
-| `map_wtr` | Recipe 原始 WTR 坐标系的 95 x 95 点阵 |
-| `map_tm` | 以 Recipe 中心为原点、y 轴反向后的 TM 坐标点阵 |
-| `map_wf` | 根据前后膜厚差生成的 WF 稀疏测量网格 |
-| `wtr_center` | WTR 坐标范围中心点 |
-| `coord_tolerance` | 坐标匹配容差，固定为 `0.001` |
-| `beam_peak` | 由回归斜率和用户系数 `k` 计算出的 Beam Peak |
-
-正确的调用顺序具有依赖关系：
+## 2. 总体处理流程
 
 ```text
-load_recipe()
-    -> 生成 map_wtr、wtr_center、map_tm
-
-load_thickness()
-    -> 生成 map_wf
-
-transfer_trimming_amount()
-    -> 将 map_wf 的去除量写入 map_tm
-
-calculate_slope()
-    -> 得到回归斜率
-
-calculate_beam_peak(k)
-    -> 得到 Beam Peak
-
-process_beam_profile()                 可选
-    -> 生成按 Beam Peak 缩放的新 Profile
-
-calculate_beam_y_integration()         可选
-    -> 得到一维积分曲线和总积分
+dwell-time CSV
+    -> load_dwell_time_matrix()
+    -> 可选 apply_vertical_mirror()
+    -> NaN 替换为 0
+                                  \
+                                   -> convolve_matrix()
+                                  /       |
+ion-beam Profile CSV             /        v
+    -> load_ion_beam_profile()       etch-depth 矩阵
+                                             |
+                                             v
+                                    generate_heatmap()
+                                      |            |
+                                      v            v
+                                     PNG          CSV
 ```
 
-## 3. 输入数据契约
+端到端入口是 `process_etch_depth()`，正常情况下返回：
 
-### 3.1 WedgeTest Recipe
-
-Recipe CSV 的有效数据行必须严格为 `95 x 95 = 9025` 行，每行必须恰好有 5 列：
-
-| CSV 列 | 代码中的含义 |
-| --- | --- |
-| A | 序号，不写入点阵 |
-| B | `x`，WTR x 坐标 |
-| C | `vx`，当前只存入 `map_wtr`，后续计算未使用 |
-| D | `y`，WTR y 坐标 |
-| E | `vy`，回归计算使用的参数 |
-
-读取时有两条特殊过滤规则：
-
-- A 列字符串等于 `"1"` 的行被视为首行并跳过；
-- B、C、D、E 四列都等于 0 的行被视为末行并跳过。
-
-过滤后若不是 9025 行，模块立即抛出异常。数据按 CSV 当前行顺序逐行填入 95 x 95 数组，代码不会额外校验坐标排序是否符合预期。
-
-### 3.2 初始与刻蚀后膜厚
-
-两个 CSV 都跳过第一行表头，随后读取前三列：
-
-```text
-X, Y, Thickness
+```python
+(heatmap_path, csv_path)
 ```
 
-坐标被四舍五入到小数点后 3 位。实际去除量定义为：
+## 3. 核心数据与对象状态
 
-```text
-Trimming Amount = Initial Thickness - After Thickness
-```
+`ConvolutionEngine` 是有状态对象。当前类中主要属性如下：
 
-当前默认数据的 Thickness 表头标记单位为 `nm`，因此在这组数据中去除量也是 `nm`。模块本身没有强制检查或换算单位。
-
-### 3.3 Beam Profile
-
-Beam Profile CSV 中每个单元格都会尝试转换成浮点数；无法转换的内容被替换成 `0.0`。
-
-- Profile 缩放阶段没有先强制检查尺寸；
-- y 方向积分阶段严格要求数组为 `31 x 31`；
-- 31 列被映射为 x 坐标 `-15` 到 `+15 mm`，步长为 `1 mm`。
-
-## 4. 核心算法
-
-### 4.1 从 WTR 坐标转换到 TM 坐标
-
-Recipe 中心不是取某个指定点，而是由坐标极值的包围盒中心计算：
-
-```text
-center_x = (max(x_wtr) + min(x_wtr)) / 2
-center_y = (max(y_wtr) + min(y_wtr)) / 2
-```
-
-每个点的 TM 坐标为：
-
-```text
-x_tm = x_wtr - center_x
-y_tm = center_y - y_wtr
-```
-
-因此 x 轴只平移，y 轴在平移的同时反向。这一步把 Recipe 坐标转换成以中心为原点、方向与膜厚测量网格一致的坐标。
-
-### 4.2 建立 WF 去除量网格
-
-代码从 initial 文件中提取唯一 x、y 坐标并排序，用最小值、最大值和唯一坐标数量推算固定步长，然后生成完整笛卡尔网格。
-
-对每个网格点 `(x, y)`：
-
-```text
-map_wf[x][y] = initial[x, y] - after[x, y]
-```
-
-若某个坐标在 initial 或 after 中不存在，该侧厚度会以 `0` 代替。
-
-### 4.3 将 WF 去除量配准到 TM 点阵
-
-代码遍历 9025 个 TM 点，在 WF 网格中寻找同时满足以下条件的坐标：
-
-```text
-abs(wf_x - x_tm) < 0.001
-abs(wf_y - y_tm) < 0.001
-```
-
-匹配成功时，将 WF 去除量写入对应 TM 点的 `trimming_amount`；未匹配的点保持 `None`。
-
-### 4.4 过原点线性回归
-
-只有满足以下全部条件的点才进入回归：
-
-- `trimming_amount` 已成功匹配；
-- `trimming_amount != 0`；
-- `vy != 0`。
-
-对每个有效点定义：
-
-```text
-x_i = 1 / vy_i
-y_i = trimming_amount_i
-```
-
-模型固定为过原点直线：
-
-```text
-y = slope * x
-```
-
-最小二乘斜率直接计算为：
-
-```text
-slope = sum(x_i * y_i) / sum(x_i^2)
-```
-
-代码要求至少有两个有效点。它不计算截距、R²、置信区间、残差或异常值，也不对不同测量点设置权重。
-
-`get_regression_data()` 和 `export_regression_data()` 使用完全相同的有效点筛选规则。导出文件固定为：
-
-```text
-Data/outputs/Regression_Data/regression_data.csv
-```
-
-### 4.5 Beam Peak
-
-用户界面提供系数 `k`，默认值为 `1.0`：
-
-```text
-Beam Peak = k * slope
-```
-
-`k` 在核心模块中没有范围限制或物理单位检查。
-
-### 4.6 Beam Profile 归一化
-
-原始 Profile 的最大值记为 `profile_max`。当 `profile_max > 0` 时：
-
-```text
-scaling_factor = Beam Peak / profile_max
-new_profile = original_profile * scaling_factor
-```
-
-这样缩放后 Profile 的最大值等于 Beam Peak，同时保留原 Profile 的相对二维形状。输出保留 8 位小数，默认保存为：
-
-```text
-Data/outputs/new_BeamShapeProfile/New_<原文件名>
-```
-
-### 4.7 Beam Profile 沿 y 方向积分
-
-对于 31 x 31 Profile，代码按列求和：
-
-```text
-y_integration[x_j] = sum(profile[:, j])
-total_integration = sum(y_integration)
-```
-
-返回结果为：
-
-1. x 坐标列表 `[-15, -14, ..., 15]`；
-2. 31 个按列求和结果；
-3. 全部 961 个单元格的总和。
-
-这里实现的是离散求和，没有显式乘以空间步长；由于当前假定步长为 `1 mm`，数值上与乘以 1 相同，但物理单位仍需要由上层业务定义。
-
-## 5. 与界面的实际衔接
-
-`ui/analyzer_ui.py` 的“执行分析”按钮按以下顺序调用本模块：
-
-1. 读取用户输入的 `k`；
-2. 加载 Recipe；
-3. 加载前后膜厚；
-4. 配准实际去除量；
-5. 计算并显示斜率及回归散点图；
-6. 可选导出回归点；
-7. 计算并显示 Beam Peak；
-8. 可选缩放 Beam Profile、计算积分并绘制一维曲线；
-9. 将 slope、Beam Peak、Beam integration 和相关系数写入 WedgeTest 日志。
-
-界面中绘制的趋势线同样使用 `y = slope * x`，与核心模块的过原点回归保持一致。
-
-## 6. 当前默认数据的验证基准
-
-使用 2026-07-18 项目目录中的默认文件执行当前代码，得到：
-
-| 指标 | 当前结果 |
-| --- | ---: |
-| Recipe 有效点阵 | 95 x 95，共 9025 点 |
-| WTR 中心 | `(43.25, 131.56)` |
-| WF 测量网格 | 21 x 21，共 441 点 |
-| 成功配准到 TM 的点 | 441 |
-| 进入回归的有效点 | 381 |
-| 过原点回归斜率 | `3384.269285907028` |
-| 当 `k = 1.0` 时的 Beam Peak | `3384.269285907028` |
-
-该结果可作为后续升级前的回归测试基线。任何算法调整都应说明是否预期改变上述点数或斜率。
-
-## 7. 当前实现中的关键假设与风险
-
-这些内容不一定都是错误，但升级时必须明确是否继续保留：
-
-1. Recipe 必须固定为 95 x 95，且依赖 CSV 行顺序，不验证二维坐标拓扑。
-2. A 列等于 `1` 的任意行都会被跳过，并不只检查文件物理首行。
-3. B 到 E 全零的任意行都会被跳过，并不只检查文件物理末行。
-4. WF 网格步长由 initial 文件推算，默认坐标均匀且至少各有两个唯一值。
-5. initial 或 after 缺失的坐标以厚度 0 参与相减，可能制造非真实去除量。
-6. 坐标先保留 3 位小数，再使用严格小于 `0.001` 的容差匹配。
-7. 未匹配点、零去除量点和 `vy = 0` 点直接排除，没有统计原因分类。
-8. 回归被强制通过原点，没有拟合优度、异常值处理和不确定度评估。
-9. `vx` 被读取但完全没有参与当前算法。
-10. Beam Profile 中无法解析的内容静默替换为 0，可能掩盖输入格式问题。
-11. Profile 缩放阶段不验证 31 x 31，直到积分阶段才检查尺寸。
-12. 回归数据和同名 New Profile 会覆盖已有输出文件。
-13. 类依赖严格调用顺序，但方法本身只对部分前置状态做显式检查。
-
-## 8. 后续升级时建议优先明确的问题
-
-在修改算法前，最好先确认以下业务定义：
-
-- `vy` 的物理含义、单位，以及使用 `1 / vy` 的理论依据；
-- 回归是否必须经过原点，是否需要截距、R²、残差和异常值策略；
-- 膜厚坐标与 TM 坐标的容差、插值和缺失点规则；
-- 固定 95 x 95 Recipe 与 21 x 21 膜厚网格是否仍是长期约束；
-- `k` 的来源，以及 Beam Peak、Beam integration 的预期物理单位；
-- Beam Profile 的坐标方向、采样间距与积分是否需要乘实际面积元素；
-- 是否需要保留当前结果作为兼容模式，并增加新版算法模式。
-
-## 9. 方法职责速查
-
-| 方法 | 主要职责 | 关键输出或副作用 |
+| 属性 | 默认值 | 作用 |
 | --- | --- | --- |
-| `load_recipe()` | 读取并验证 Recipe | `map_wtr`、`wtr_center`、`map_tm` |
-| `_generate_tm_mapping()` | WTR 转 TM 坐标 | 95 x 95 `map_tm` |
-| `load_thickness()` | 计算前后膜厚差 | `map_wf` |
-| `_read_thickness_file()` | 读取三列膜厚 CSV | `{(x, y): thickness}` |
-| `transfer_trimming_amount()` | WF 与 TM 坐标匹配 | 写入 `trimming_amount` |
-| `calculate_slope()` | 过原点最小二乘回归 | `slope` |
-| `get_regression_data()` | 获取绘图数据 | `x_data, y_data` |
-| `export_regression_data()` | 导出回归点 | `regression_data.csv` |
-| `calculate_beam_peak()` | 应用用户系数 | `beam_peak = k * slope` |
-| `process_beam_profile()` | 将 Profile 峰值归一到 Beam Peak | 新 Profile CSV |
-| `calculate_beam_y_integration()` | 对 31 x 31 Profile 按列求和 | x、积分曲线、总积分 |
+| `dwell_matrix` | `None` | 预留的 dwell 矩阵状态；当前流程没有回写该属性 |
+| `ion_beam_profile` | `None` | 预留的 Beam Profile 状态；当前流程没有回写该属性 |
+| `etch_depth_matrix` | `None` | 预留的刻蚀深度状态；当前流程没有回写该属性 |
+| `x_coords` | `None` | 最近一次读取的 dwell x 坐标 |
+| `y_coords` | `None` | 最近一次读取的原始 dwell y 坐标 |
+| `circle_mode` | `False` | 是否在热力图中仅显示圆形区域 |
+| `circle_style` | `"jet"` | 圆形模式下使用的 Matplotlib colormap |
+| `circle_diameter` | `0` | 圆形区域直径，界面中按 mm 输入 |
+| `center_x` | `0` | 圆心 x 坐标 |
+| `center_y` | `0` | 圆心或镜像中心 y 坐标 |
+| `mirror_x` | `False` | 是否执行上下翻转，即关于水平轴的镜像 |
+| `last_mirror_state` | `False` | 最近一次计算实际采用的镜像状态，用于输出命名和标题 |
+
+脚本通过 `matplotlib.use('Agg')` 选择非交互式后端，目的是允许工作线程在不打开 Matplotlib 窗口的情况下生成 PNG。
+
+## 4. 输入文件格式
+
+### 4.1 Dwell-time CSV
+
+首选读取方式是：
+
+```python
+pd.read_csv(file_path, index_col=0)
+```
+
+约定格式为：
+
+```text
+Y\X, x0, x1, x2, ...
+y0, value, value, value, ...
+y1, value, value, value, ...
+...
+```
+
+- 第一行除首格外是 x 坐标；
+- 第一列除首格外是 y 坐标；
+- 其余区域构成 dwell-time 矩阵；
+- Pandas 读取失败时，代码会调用 `_fallback_load_dwell_time()` 手动解析。
+
+后备解析支持第一格为 `Coordinate (mm)` 的说明格式，也会把无法转换的数值写成 `NaN`。正常主流程在卷积前把所有 `NaN` 替换为 `0.0`。
+
+### 4.2 Ion Beam Profile CSV
+
+Beam Profile 不包含坐标表头，所有可解析的数值直接组成二维矩阵：
+
+```text
+value, value, value, ...
+value, value, value, ...
+...
+```
+
+- 空行被跳过；
+- 空单元格被跳过；
+- 无法转换成浮点数的单元格也被跳过；
+- 文件使用 UTF-8 读取，无法解码的字符被忽略。
+
+当前代码只检查矩阵是否为空，没有强制要求 Profile 必须为固定尺寸。不过项目中的典型 Beam Profile 是 31 x 31。
+
+## 5. 核心数学过程
+
+### 5.1 圆形遮罩
+
+给定圆心 `(center_x, center_y)` 和直径 `diameter`，半径为：
+
+```text
+radius = diameter / 2
+```
+
+网格点到圆心的距离为：
+
+```text
+distance = sqrt((X - center_x)^2 + (Y - center_y)^2)
+```
+
+满足 `distance <= radius` 的点保留，圆外数据设为 `NaN`。
+
+需要特别注意：当前圆形遮罩只应用于热力图的 `viz_matrix`。输出的刻蚀深度 CSV 始终保存未遮罩的完整矩阵，因此圆形模式是显示模式，不是数值裁剪模式。
+
+### 5.2 上下镜像与坐标转换
+
+矩阵通过以下操作上下翻转：
+
+```python
+flipped_matrix = np.flipud(matrix)
+```
+
+镜像中心优先使用传入的 `center_y`；只有 `center_y` 是 `NaN` 时，才自动使用 y 坐标范围中点：
+
+```text
+center = (min(y) + max(y)) / 2
+```
+
+镜像后的坐标为：
+
+```text
+y_mirrored = 2 * center - y_original
+```
+
+坐标数组随后反序，以保持与翻转后矩阵的行顺序一致。界面中将这一操作描述为“沿 X 轴镜像翻转”，因为它改变上下方向和 y 坐标，x 坐标保持不变。
+
+### 5.3 二维卷积
+
+代码首先把 Beam Profile 沿 x、y 两个方向翻转，相当于旋转 180°：
+
+```python
+kernel = np.flipud(np.fliplr(ion_beam_profile))
+```
+
+然后执行：
+
+```python
+etch_depth = scipy.ndimage.convolve(
+    dwell_matrix,
+    kernel,
+    mode="constant",
+    cval=0.0,
+)
+```
+
+当前实现的关键特征：
+
+- 输出矩阵尺寸与 dwell-time 矩阵相同；
+- 边界外数据按 0 处理；
+- Beam Profile 不做归一化；
+- 不显式乘坐标步长或像素面积；
+- dwell 中的 `NaN` 在卷积前变为 0；
+- Profile 的朝向由显式 180° 翻转和 `ndi.convolve` 的定义共同决定。
+
+如果 dwell-time 单位为秒、Beam Profile 数值单位为 `nm/s`，离散累加结果可以解释为 `nm`。代码和输出标签采用 `Etch Depth (nm)`，但模块本身不会检查输入单位。
+
+## 6. 各方法作用
+
+### `__init__()`
+
+初始化计算状态、圆形显示参数和镜像开关。当前真正参与流程的是坐标、圆形参数、`mirror_x` 和 `last_mirror_state`；三个矩阵属性目前只是预留字段。
+
+### `set_circle_params(diameter, center_x, center_y)`
+
+保存圆形区域的直径和圆心。该方法不启用圆形模式，`circle_mode` 由界面单独设置。
+
+### `create_circle_mask(X, Y, center_x, center_y, diameter)`
+
+根据二维坐标网格计算布尔圆形遮罩。圆内和圆周为 `True`，圆外为 `False`。
+
+### `apply_circle_mask(matrix, x_coords, y_coords)`
+
+通过 `np.meshgrid()` 构造坐标网格，调用 `create_circle_mask()`，复制输入矩阵，并把圆外元素改成 `NaN`。输入矩阵尺寸应与 `(len(y_coords), len(x_coords))` 一致。
+
+### `load_dwell_time_matrix(file_path)`
+
+使用 Pandas 读取带坐标的 dwell-time CSV：
+
+- DataFrame 列名转成 x 坐标；
+- DataFrame index 转成 y 坐标；
+- DataFrame values 作为 dwell 矩阵。
+
+Pandas 解析失败时打印错误并转入后备解析。返回：
+
+```python
+(dwell_matrix, x_coords, y_coords)
+```
+
+### `_fallback_load_dwell_time(file_path)`
+
+用标准库 `csv` 手动解析 dwell 文件。它负责提取表头坐标、逐行读取 y 坐标及矩阵值，并在失败时返回三个空数组。
+
+这是兼容性路径，不是当前标准 RecipeEngine 输出的主要读取路径。
+
+### `apply_vertical_mirror(matrix, y_coords, center_y)`
+
+执行矩阵上下翻转，同时围绕指定 y 中心变换 y 坐标。返回：
+
+```python
+(flipped_matrix, mirrored_y_coords, actual_center)
+```
+
+### `save_flipped_dwell_file(...)`
+
+将镜像后的 dwell 矩阵保存到：
+
+```text
+<base_name>_dwell_mirrored.csv
+```
+
+首行写 x 坐标、首列写 y 坐标。数值根据大小选择科学计数法或 6 位小数；`NaN` 写成字符串 `NaN`。保存失败时返回 `None`。
+
+### `load_ion_beam_profile(file_path)`
+
+读取无坐标表头的二维 Beam Profile，提取所有可转换的浮点数并构造 NumPy 数组。失败时打印原因并返回空数组。
+
+### `convolve_matrix(dwell_matrix, ion_beam_profile)`
+
+验证两个矩阵非空，将 Profile 旋转 180°，再调用 `scipy.ndimage.convolve()` 计算刻蚀深度矩阵。输入为空时抛出 `ValueError`。
+
+### `generate_heatmap(matrix, x_coords, y_coords, output_dir, base_name, mirror_center=None)`
+
+同时生成 PNG 与 CSV，是输出逻辑的主体。
+
+PNG 处理包括：
+
+- 可选圆形遮罩；
+- 忽略 `NaN` 计算色标范围；
+- 当全部有效值为正且动态范围大于 1000 倍时尝试使用 `LogNorm`；
+- 圆形模式使用用户指定 colormap，矩形模式固定使用 `viridis`；
+- 圆形模式绘制白色虚线边界并保持等比例坐标轴；
+- 镜像模式在标题和文件名中加入 `Mirrored`；
+- 图片以 150 DPI 输出。
+
+CSV 处理包括：
+
+- 首行写 x 坐标，首列写 y 坐标；
+- 保存完整、未应用圆形遮罩的原始刻蚀深度矩阵；
+- `NaN` 写为 `NaN`；
+- 很小或大于 1000 的值采用科学计数法，其余保留 6 位小数。
+
+即使 PNG 生成失败，方法也会创建一张包含错误文字的 PNG；CSV 失败则只打印错误。最后仍返回预定的两个路径。
+
+### `process_etch_depth(dwell_time_csv, ion_beam_csv)`
+
+端到端主入口，执行顺序如下：
+
+1. 读取 dwell 矩阵及坐标；
+2. 保存最近一次原始 x、y 坐标；
+3. 检查 dwell 数据非空；
+4. 记录本次镜像状态；
+5. 可选执行上下镜像，并保存镜像 dwell CSV；
+6. 将 dwell 中的 `NaN` 替换为 0；
+7. 读取 Beam Profile；
+8. 检查 Profile 非空；
+9. 执行二维卷积；
+10. 在 `Data/convolution_results/` 生成结果文件。
+
+如果任意步骤发生异常，该方法不会继续向调用方抛出异常，而是生成：
+
+```text
+<base_name>_error.png
+<base_name>_error.csv
+```
+
+然后同样返回这两个错误占位文件的路径。
+
+## 7. 输出文件命名
+
+正常输出目录由当前进程工作目录决定：
+
+```text
+Data/convolution_results/
+```
+
+| 场景 | PNG | CSV |
+| --- | --- | --- |
+| 普通 | `<base>_etch_depth_heatmap.png` | `<base>_etch_depth_distribution.csv` |
+| 镜像 | `<base>_mirrored_etch_depth_heatmap.png` | `<base>_etch_depth_distribution_mirrored.csv` |
+| 圆形 | `<base>_circular_etch_depth_heatmap.png` | `<base>_etch_depth_distribution.csv` |
+| 镜像且圆形 | `<base>_mirrored_circular_etch_depth_heatmap.png` | `<base>_etch_depth_distribution_mirrored.csv` |
+| 失败 | `<base>_error.png` | `<base>_error.csv` |
+
+圆形后缀只出现在 PNG，因为 CSV 保存的始终是完整矩阵。相同输入文件名再次计算会覆盖旧输出。
+
+## 8. 在 WTV 中的调用关系
+
+### `ui/convolution_integral_ui.py`
+
+界面持有一个 `ConvolutionEngine` 实例，并允许用户：
+
+- 选择 dwell-time 和 Beam Profile 文件；
+- 开关圆形显示；
+- 设置圆直径、圆心和 colormap；
+- 开关沿 X 轴镜像；
+- 在 `QThread` 中调用 `process_etch_depth()`；
+- 计算完成后加载并显示 PNG。
+
+工作线程只把 PNG 路径和状态文字发回界面，CSV 路径没有直接显示给用户。
+
+### `core/etching_processor.py`
+
+`IonBeamProcessor.convolve_dwell_time()` 会把内部 dwell-time 和 Beam Profile 临时保存成 CSV，调用本引擎，再读取结果 CSV。该结果用于：
+
+- 与目标刻蚀深度图比较；
+- 计算晶圆内部的最小值、最大值、平均值；
+- 计算模拟结果与目标结果的 MSE。
+
+因此该引擎不仅负责图片展示，也参与刻蚀优化流程的结果验算。
+
+## 9. 当前默认数据验证基准
+
+使用项目根目录中的以下文件进行只读计算：
+
+```text
+Base_Recipe_auto_21-2301_y_dwell_time_distribution.csv
+ion_beam_profile.csv
+```
+
+当前结果为：
+
+| 指标 | 结果 |
+| --- | ---: |
+| dwell 矩阵 | 179 x 180 |
+| x 范围 | -40.5 到 138.5，共 180 点 |
+| y 范围 | 22.62 到 200.62，共 179 点 |
+| dwell 中 NaN 数 | 358 |
+| dwell 非 NaN 范围 | 0.007849 到 0.020383 |
+| Beam Profile | 31 x 31 |
+| Beam Profile 范围 | 0 到 264.794853605203 |
+| Beam Profile 总和 | 6473.443959629525 |
+| 卷积输出 | 179 x 180 |
+| 刻蚀深度范围 | 17.924143174079948 到 117.4525493431736 |
+| 刻蚀深度矩阵总和 | 2661150.3187331604 |
+
+该结果没有写出文件，可作为后续重构卷积算法时的数值回归基线。
+
+## 10. 当前实现的假设与升级注意点
+
+以下是当前真实行为，后续修改时应明确是否保持兼容：
+
+1. dwell 主读取路径依赖首列为 y 坐标、表头其余列为 x 坐标。
+2. 后备解析遇到 `Coordinate (mm)` 时会把下一行当成新表头，需确认是否完全符合所有历史文件格式。
+3. 后备 dwell 解析和 Beam Profile 解析会跳过空单元格，可能造成行长度不一致。
+4. 主流程只检查数组非空，没有显式验证矩阵、x 坐标和 y 坐标的尺寸一致性。
+5. dwell 中缺失值直接按 0 参与卷积；输入中的正负无穷值没有业务级校验。
+6. Profile 没有归一化，输出量级直接依赖 Profile 原始标定。
+7. 卷积没有乘空间采样间距，因此默认把每个网格单元视为等权离散样本。
+8. 边界使用零填充，靠近矩阵边缘的刻蚀深度会受到截断效应影响。
+9. `mirror_x` 实际翻转矩阵行和 y 坐标，名称表示“关于 X 轴镜像”，不是翻转 x 列。
+10. 当界面圆心 y 默认为 0 时，镜像围绕 y=0，而不是自动围绕数据范围中点。
+11. 圆形模式只改变 PNG，不改变卷积输入和输出 CSV。
+12. 动态范围很大时同时传入 `LogNorm`、`vmin` 和 `vmax`，需要针对当前 Matplotlib 版本验证兼容性。
+13. `matplotlib.use('Agg')` 位于 `pyplot` 导入之后，严格来说后端选择最好在导入 `pyplot` 前完成。
+14. `process_etch_depth()` 把异常转换成错误文件，因此上层线程通常仍会收到“finished”而不是“error”信号。
+15. 输出目录基于当前工作目录，而不是脚本位置或统一资源路径。
+16. 同名输入会覆盖已有输出，没有时间戳或版本号。
+17. `dwell_matrix`、`ion_beam_profile`、`etch_depth_matrix` 和 `orig_y_coords` 当前没有被后续逻辑使用。
+18. `matplotlib.cm` 和 `io` 当前是未使用导入。
+
+## 11. 方法速查表
+
+| 方法 | 主要职责 | 返回值 |
+| --- | --- | --- |
+| `__init__()` | 初始化引擎状态和显示参数 | 无 |
+| `set_circle_params()` | 设置圆直径和圆心 | 无 |
+| `create_circle_mask()` | 计算圆形布尔遮罩 | `mask` |
+| `apply_circle_mask()` | 将矩阵圆外区域设为 NaN | `masked_matrix` |
+| `load_dwell_time_matrix()` | 用 Pandas 读取 dwell 网格 | `matrix, x, y` |
+| `_fallback_load_dwell_time()` | 手动兼容读取 dwell 网格 | `matrix, x, y` |
+| `apply_vertical_mirror()` | 翻转矩阵并转换 y 坐标 | `matrix, y, center` |
+| `save_flipped_dwell_file()` | 保存镜像 dwell CSV | 路径或 `None` |
+| `load_ion_beam_profile()` | 读取 Beam Profile | 二维数组 |
+| `convolve_matrix()` | 执行离散二维卷积 | 刻蚀深度矩阵 |
+| `generate_heatmap()` | 输出热力图和坐标化 CSV | `image_path, csv_path` |
+| `process_etch_depth()` | 执行完整计算流程 | `image_path, csv_path` |
 
 ---
 
-本文档依据当前 `core/wedgeTestResult_analyzer.py` 与其在 `ui/analyzer_ui.py` 中的实际调用方式编写，描述的是现有版本行为，而不是理想化设计。
+本文档依据当前 `core/convolution_engine.py`、`ui/convolution_integral_ui.py` 和 `core/etching_processor.py` 的实际实现编写，描述的是现有版本行为。
